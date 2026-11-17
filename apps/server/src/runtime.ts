@@ -1,3 +1,5 @@
+import dotenv from 'dotenv';
+import path from 'node:path';
 import {
   ApprovalDecision,
   BaseAgentHarness,
@@ -18,7 +20,14 @@ export class AgentRuntime {
     this.initAgents();
   }
 
+  private reloadEnv(): void {
+    dotenv.config();
+    dotenv.config({ path: path.resolve(process.cwd(), '.env'), override: true });
+    dotenv.config({ path: path.resolve(process.cwd(), '../../.env'), override: true });
+  }
+
   private initAgents(): void {
+    this.reloadEnv();
     const tools = [queryDatabaseTool, deployServiceTool, sendNotificationTool];
     const approvalRules = [
       {
@@ -87,18 +96,33 @@ export class AgentRuntime {
     this.harnesses.set('default-ops', mockHarness);
   }
 
-  getHarness(agentId = 'default-ops'): BaseAgentHarness {
-    if (this.harnesses.has(agentId)) {
+  getHarness(agentId?: string): BaseAgentHarness {
+    this.reloadEnv();
+    if (process.env.ANTHROPIC_API_KEY && !this.harnesses.has('claude-ops')) {
+      this.initAgents();
+    }
+
+    if (agentId && this.harnesses.has(agentId)) {
       return this.harnesses.get(agentId)!;
     }
-    // Fall back to default
+
+    // Prefer Claude if available
+    if (this.harnesses.has('claude-ops')) {
+      return this.harnesses.get('claude-ops')!;
+    }
+
     return this.harnesses.get('default-ops')!;
   }
 
   listAgents(): Array<{ id: string; type: string }> {
+    this.reloadEnv();
+    if (process.env.ANTHROPIC_API_KEY && !this.harnesses.has('claude-ops')) {
+      this.initAgents();
+    }
+
     return Array.from(this.harnesses.entries()).map(([id, harness]) => ({
       id,
-      type: harness instanceof ClaudeAgentHarness ? 'Claude Agent SDK' : 'Mock/Test Engine',
+      type: harness instanceof ClaudeAgentHarness ? 'Claude Agent SDK (Live Anthropic API)' : 'Mock/Test Engine',
     }));
   }
 

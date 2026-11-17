@@ -1,10 +1,14 @@
 import fastify from 'fastify';
 import cors from '@fastify/cors';
 import dotenv from 'dotenv';
+import path from 'node:path';
 import { AgentRuntime } from './runtime.js';
 import { sessionRoutes } from './routes/session-routes.js';
 
+// Load .env from cwd and monorepo root
 dotenv.config();
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+dotenv.config({ path: path.resolve(process.cwd(), '../../.env') });
 
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 const host = process.env.HOST || '0.0.0.0';
