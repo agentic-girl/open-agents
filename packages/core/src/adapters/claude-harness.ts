@@ -1,4 +1,4 @@
-import { query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 import { BaseAgentHarness, StepAction } from '../harness/base-harness.js';
 import {
   ApprovalDecision,
@@ -12,17 +12,24 @@ import { EventStore } from '../store/event-store.js';
 export interface ClaudeHarnessConfig extends HarnessConfig {
   apiKey?: string;
   defaultModel?: string;
+  permissionMode?: PermissionMode;
+  allowDangerouslySkipPermissions?: boolean;
 }
 
 export class ClaudeAgentHarness extends BaseAgentHarness {
   private model: string;
   private apiKey?: string;
+  private permissionMode: PermissionMode;
+  private allowDangerouslySkipPermissions: boolean;
 
   constructor(config: ClaudeHarnessConfig, store: EventStore) {
     super(config, store);
     // Official Claude Agent SDK model ID
     this.model = config.model || config.defaultModel || 'claude-sonnet-5-5';
     this.apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
+    // Default to bypassPermissions mode
+    this.permissionMode = config.permissionMode || 'bypassPermissions';
+    this.allowDangerouslySkipPermissions = config.allowDangerouslySkipPermissions ?? true;
   }
 
   /**
@@ -80,7 +87,8 @@ export class ClaudeAgentHarness extends BaseAgentHarness {
           model: this.model,
           systemPrompt: this.config.instructions,
           maxTurns: this.limits.maxSteps,
-          permissionMode: 'acceptEdits',
+          permissionMode: this.permissionMode,
+          allowDangerouslySkipPermissions: this.allowDangerouslySkipPermissions,
           env,
         },
       });
