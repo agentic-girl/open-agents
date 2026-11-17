@@ -283,7 +283,7 @@ export abstract class BaseAgentHarness {
     }
   }
 
-  private checkApprovalRule(toolName: string, args: Record<string, unknown>): ApprovalRule | undefined {
+  protected checkApprovalRule(toolName: string, args: Record<string, unknown>): ApprovalRule | undefined {
     if (!this.config.approvalRules) return undefined;
     return this.config.approvalRules.find((rule) => {
       if (rule.toolName !== toolName) return false;

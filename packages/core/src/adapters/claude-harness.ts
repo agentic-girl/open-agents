@@ -1,6 +1,12 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { query, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { BaseAgentHarness, StepAction } from '../harness/base-harness.js';
-import { HarnessConfig, HarnessUsage } from '../types/index.js';
+import {
+  ApprovalDecision,
+  HarnessConfig,
+  HarnessRunOptions,
+  HarnessRunResult,
+  HarnessUsage,
+} from '../types/index.js';
 import { EventStore } from '../store/event-store.js';
 
 export interface ClaudeHarnessConfig extends HarnessConfig {
@@ -9,98 +15,255 @@ export interface ClaudeHarnessConfig extends HarnessConfig {
 }
 
 export class ClaudeAgentHarness extends BaseAgentHarness {
-  private client: Anthropic;
   private model: string;
+  private apiKey?: string;
 
   constructor(config: ClaudeHarnessConfig, store: EventStore) {
     super(config, store);
-    this.client = new Anthropic({
-      apiKey: config.apiKey || process.env.ANTHROPIC_API_KEY,
-    });
-    this.model = config.model || config.defaultModel || 'claude-3-5-sonnet-20241022';
+    // Official Claude Agent SDK model ID
+    this.model = config.model || config.defaultModel || 'claude-sonnet-5-5';
+    this.apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
   }
 
+  /**
+   * Base fallback for single-step execution
+   */
   protected async executeStep(
-    sessionId: string,
-    history: Array<{ role: 'user' | 'assistant' | 'tool'; content: any }>,
-    usage: HarnessUsage,
+    _sessionId: string,
+    _history: Array<{ role: 'user' | 'assistant' | 'tool'; content: any }>,
+    _usage: HarnessUsage,
   ): Promise<StepAction> {
-    const anthropicTools = this.toolRegistry.toAnthropicTools();
+    return { type: 'complete', content: 'Completed.' };
+  }
 
-    // Map history to Anthropic Messages format
-    const messages: Anthropic.MessageParam[] = [];
+  /**
+   * Overrides run() to consume the official Claude Agent SDK query stream directly
+   */
+  override async run(options: HarnessRunOptions): Promise<HarnessRunResult> {
+    const { sessionId, prompt } = options;
+    const startTime = Date.now();
 
-    for (const item of history) {
-      if (item.role === 'user') {
-        messages.push({
-          role: 'user',
-          content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content),
-        });
-      } else if (item.role === 'assistant') {
-        messages.push({
-          role: 'assistant',
-          content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content),
-        });
-      } else if (item.role === 'tool') {
-        messages.push({
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: `tool_${Date.now()}`,
-              content: JSON.stringify(item.content),
-            },
-          ],
-        });
-      }
+    const usage: HarnessUsage = {
+      stepsTaken: 0,
+      tokensUsed: 0,
+      elapsedMs: 0,
+    };
+
+    let session = await this.store.getSession(sessionId);
+    if (!session) {
+      session = await this.store.createSession({
+        id: sessionId,
+        agentId: this.config.agentId,
+      });
+    }
+
+    await this.store.updateSessionStatus(sessionId, 'running');
+
+    await this.emit(sessionId, 'agent:started', {
+      agentId: this.config.agentId,
+      model: this.model,
+      prompt,
+      limits: this.limits,
+    });
+
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+    };
+    if (this.apiKey) {
+      env.ANTHROPIC_API_KEY = this.apiKey;
     }
 
     try {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 4096,
-        system: this.config.instructions,
-        messages,
-        ...(anthropicTools.length > 0 ? { tools: anthropicTools as any } : {}),
+      const q = query({
+        prompt,
+        options: {
+          model: this.model,
+          systemPrompt: this.config.instructions,
+          maxTurns: this.limits.maxSteps,
+          permissionMode: 'acceptEdits',
+          env,
+        },
       });
 
-      // Track token usage
-      if (response.usage) {
-        usage.tokensUsed += response.usage.input_tokens + response.usage.output_tokens;
+      let finalOutput = '';
+
+      for await (const msg of q) {
+        usage.elapsedMs = Date.now() - startTime;
+
+        if (msg.type === 'assistant') {
+          const assistantMsg = (msg as any).message;
+          const contentBlocks = assistantMsg?.content || [];
+
+          for (const block of contentBlocks) {
+            // 1. Thinking / Reasoning block
+            if (block.type === 'thinking' && block.thinking) {
+              await this.emit(sessionId, 'agent:thought', {
+                thought: block.thinking,
+              });
+            }
+
+            // 2. Text response chunk
+            if (block.type === 'text' && block.text) {
+              finalOutput += block.text;
+              await this.emit(sessionId, 'agent:message', {
+                text: block.text,
+              });
+            }
+
+            // 3. Tool invocation block
+            if (block.type === 'tool_use') {
+              usage.stepsTaken += 1;
+              const toolName = block.name;
+              const toolArgs = (block.input as Record<string, unknown>) || {};
+
+              // Check human-in-the-loop approval rule
+              const triggerRule = this.checkApprovalRule(toolName, toolArgs);
+
+              if (triggerRule) {
+                const interruptId = `int_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+                const interrupt = await this.store.createInterrupt({
+                  id: interruptId,
+                  sessionId,
+                  type: 'tool_approval',
+                  toolName,
+                  toolArgs,
+                  reason:
+                    triggerRule.message ||
+                    `Approval required before executing tool "${toolName}"`,
+                });
+
+                await this.emit(sessionId, 'agent:suspended', {
+                  interruptId: interrupt.id,
+                  toolName,
+                  toolArgs,
+                  reason: interrupt.reason,
+                });
+
+                await this.store.updateSessionStatus(sessionId, 'suspended');
+
+                return {
+                  sessionId,
+                  status: 'suspended',
+                  usage,
+                };
+              }
+
+              // Emit normal tool called
+              await this.emit(sessionId, 'tool:called', {
+                toolName,
+                toolArgs,
+              });
+
+              // Execute tool if registered
+              if (this.toolRegistry.has(toolName)) {
+                try {
+                  const result = await this.toolRegistry.execute(toolName, toolArgs, {
+                    sessionId,
+                    toolName,
+                  });
+                  await this.emit(sessionId, 'tool:result', {
+                    toolName,
+                    result,
+                  });
+                } catch (err: any) {
+                  await this.emit(sessionId, 'tool:result', {
+                    toolName,
+                    error: err.message,
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        // Result / Completion message
+        if (msg.type === 'result') {
+          await this.emit(sessionId, 'agent:completed', {
+            output: finalOutput,
+            usage,
+          });
+          await this.store.updateSessionStatus(sessionId, 'completed');
+          return {
+            sessionId,
+            status: 'completed',
+            output: finalOutput,
+            usage,
+          };
+        }
       }
 
-      // Check for tool calls
-      const toolUseBlock = response.content.find((block) => block.type === 'tool_use') as
-        | Anthropic.ToolUseBlock
-        | undefined;
-
-      if (toolUseBlock) {
-        return {
-          type: 'tool_call',
-          toolName: toolUseBlock.name,
-          toolArgs: (toolUseBlock.input as Record<string, unknown>) || {},
-        };
-      }
-
-      // Extract text content
-      const textBlocks = response.content
-        .filter((block) => block.type === 'text')
-        .map((b) => (b as Anthropic.TextBlock).text)
-        .join('\n');
-
-      if (response.stop_reason === 'end_turn') {
-        return {
-          type: 'complete',
-          content: textBlocks,
-        };
-      }
-
+      await this.emit(sessionId, 'agent:completed', {
+        output: finalOutput,
+        usage,
+      });
+      await this.store.updateSessionStatus(sessionId, 'completed');
       return {
-        type: 'message',
-        content: textBlocks,
+        sessionId,
+        status: 'completed',
+        output: finalOutput,
+        usage,
       };
     } catch (err: any) {
-      throw new Error(`Claude API call failed: ${err.message}`);
+      const errorMsg = err.message || 'Claude Agent SDK query failed';
+      await this.emit(sessionId, 'agent:failed', { error: errorMsg, usage });
+      await this.store.updateSessionStatus(sessionId, 'failed');
+      return {
+        sessionId,
+        status: 'failed',
+        error: errorMsg,
+        usage,
+      };
     }
   }
+
+  override async resume(decision: ApprovalDecision): Promise<HarnessRunResult> {
+    const interrupt = await this.store.getInterrupt(decision.interruptId);
+    if (!interrupt) {
+      throw new Error(`Interrupt ${decision.interruptId} not found`);
+    }
+
+    await this.store.resolveInterrupt(decision);
+
+    await this.emit(interrupt.sessionId, 'agent:resumed', {
+      interruptId: decision.interruptId,
+      approved: decision.approved,
+      modifiedArgs: decision.modifiedArgs,
+      feedback: decision.feedback,
+    });
+
+    if (!decision.approved) {
+      const errorMsg = decision.feedback || `Tool execution rejected by operator`;
+      await this.emit(interrupt.sessionId, 'agent:failed', { error: errorMsg });
+      await this.store.updateSessionStatus(interrupt.sessionId, 'failed');
+      return {
+        sessionId: interrupt.sessionId,
+        status: 'failed',
+        error: errorMsg,
+        usage: { stepsTaken: 0, tokensUsed: 0, elapsedMs: 0 },
+      };
+    }
+
+    const toolName = interrupt.toolName!;
+    const toolArgs = decision.modifiedArgs || interrupt.toolArgs || {};
+
+    let toolResult: unknown = { status: 'executed', toolName };
+    if (this.toolRegistry.has(toolName)) {
+      toolResult = await this.toolRegistry.execute(toolName, toolArgs, {
+        sessionId: interrupt.sessionId,
+        toolName,
+      });
+    }
+
+    await this.emit(interrupt.sessionId, 'tool:result', {
+      toolName,
+      result: toolResult,
+    });
+
+    // Resume query loop with the approved tool result
+    return this.run({
+      sessionId: interrupt.sessionId,
+      prompt: `Tool "${toolName}" was approved by operator and executed. Result: ${JSON.stringify(toolResult)}. Complete the request.`,
+    });
+  }
 }
+
