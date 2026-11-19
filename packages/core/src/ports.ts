@@ -53,6 +53,9 @@ export interface StoreAdapter {
   appendBlock(sessionId: string, turnId: string, payload: BlockPayload): Promise<SessionBlock>;
   getBlocksAfter(sessionId: string, afterSeq: number, limit?: number): Promise<SessionBlock[]>;
 
+  getSetting?(key: string): Promise<string | null>;
+  setSetting?(key: string, value: string | null): Promise<void>;
+
   close?(): Promise<void> | void;
 }
 

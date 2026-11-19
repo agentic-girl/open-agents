@@ -1,28 +1,98 @@
+import { existsSync } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { stream } from 'hono/streaming';
 import { z, ZodError } from 'zod';
 import {
-  HarnessNotFoundError,
+  createOpenAgentsHandler,
   type OpenAgentsEngine,
-  SessionBusyError,
-  SessionNotFoundError,
 } from '@open-agents/core';
 
-const createSessionSchema = z.object({
-  title: z.string().max(200).optional(),
-  harnessId: z.string().min(1).optional(),
-  model: z.string().min(1).optional(),
-  cwd: z.string().min(1).optional(),
+export const ANTHROPIC_KEY_SETTING = 'anthropic_api_key';
+
+export interface CreateServerAppOptions {
+  /**
+   * Optional path to compiled frontend SPA directory (e.g. `apps/web/dist`).
+   * When present, the Hono server serves both `/api/*` and the turnkey UI on a single port.
+   */
+  staticDir?: string;
+}
+
+const credentialsSchema = z.object({
+  anthropicApiKey: z.string().nullable(),
 });
 
-const submitTurnSchema = z.object({
-  prompt: z.string().trim().min(1, 'Prompt cannot be empty'),
-  systemPrompt: z.string().optional(),
-});
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+};
 
-export function createServerApp(engine: OpenAgentsEngine): Hono {
+export function maskSecret(secret: string): string {
+  const trimmed = secret.trim();
+  if (trimmed.length <= 10) return '••••••••';
+  return `${trimmed.slice(0, 7)}...${trimmed.slice(-4)}`;
+}
+
+export async function resolveConfiguredAnthropicKey(
+  engine: OpenAgentsEngine,
+): Promise<{
+  configured: boolean;
+  source: 'env' | 'store' | 'oauth' | 'none';
+  maskedKey: string | null;
+  rawKey?: string;
+}> {
+  const storedKey = await engine.store.getSetting?.(ANTHROPIC_KEY_SETTING);
+  if (storedKey && storedKey.trim()) {
+    return {
+      configured: true,
+      source: 'store',
+      maskedKey: maskSecret(storedKey),
+      rawKey: storedKey.trim(),
+    };
+  }
+
+  const envKey = process.env.ANTHROPIC_API_KEY?.trim();
+  if (envKey) {
+    return {
+      configured: true,
+      source: 'env',
+      maskedKey: maskSecret(envKey),
+      rawKey: envKey,
+    };
+  }
+
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim()) {
+    return {
+      configured: true,
+      source: 'oauth',
+      maskedKey: 'oauth-token',
+    };
+  }
+
+  return {
+    configured: false,
+    source: 'none',
+    maskedKey: null,
+  };
+}
+
+export function createServerApp(
+  engine: OpenAgentsEngine,
+  options: CreateServerAppOptions = {},
+): Hono {
   const app = new Hono();
+  const coreHandler = createOpenAgentsHandler(engine, {
+    basePath: '/api',
+    cors: true,
+  });
 
   app.use(
     '/api/*',
@@ -33,137 +103,89 @@ export function createServerApp(engine: OpenAgentsEngine): Hono {
     }),
   );
 
-  app.get('/api/health', (c) => {
-    return c.json({
-      status: 'ok',
-      harnesses: engine.listHarnesses(),
-      anthropicConfigured: Boolean(process.env.ANTHROPIC_API_KEY),
-      timestamp: new Date().toISOString(),
-    });
-  });
-
-  app.get('/api/harnesses', (c) => {
-    return c.json({ harnesses: engine.listHarnesses() });
-  });
-
-  app.get('/api/sessions', async (c) => {
-    const rawLimit = c.req.query('limit');
-    const limit = rawLimit ? Math.min(Math.max(parseInt(rawLimit, 10) || 50, 1), 200) : 50;
-    const sessions = await engine.listSessions(limit);
-    return c.json({ sessions });
-  });
-
-  app.post('/api/sessions', async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const parsed = createSessionSchema.parse(body);
-    const session = await engine.createSession(parsed);
-    return c.json(session, 201);
-  });
-
-  app.get('/api/sessions/:id', async (c) => {
-    const session = await engine.getSession(c.req.param('id'));
-    return c.json(session);
-  });
-
-  app.delete('/api/sessions/:id', async (c) => {
-    const deleted = await engine.deleteSession(c.req.param('id'));
-    if (!deleted) {
-      throw new SessionNotFoundError(c.req.param('id'));
-    }
-    return c.body(null, 204);
-  });
-
-  app.get('/api/sessions/:id/status', async (c) => {
+  // Runtime credential status & zero-restart in-UI key setup
+  app.get('/api/settings/credentials', async (c) => {
     c.header('Cache-Control', 'no-store');
-    const snapshot = await engine.getSessionStatus(c.req.param('id'));
-    return c.json(snapshot);
-  });
-
-  app.post('/api/sessions/:id/turns', async (c) => {
-    const body = await c.req.json();
-    const parsed = submitTurnSchema.parse(body);
-    const result = await engine.submitTurn(c.req.param('id'), parsed.prompt, {
-      systemPrompt: parsed.systemPrompt,
+    const status = await resolveConfiguredAnthropicKey(engine);
+    return c.json({
+      configured: status.configured,
+      source: status.source,
+      maskedKey: status.maskedKey,
     });
-    return c.json(result, 202);
   });
 
-  app.post('/api/sessions/:id/abort', async (c) => {
-    const aborted = await engine.abortTurn(c.req.param('id'));
-    return c.json({ aborted });
-  });
+  app.post('/api/settings/credentials', async (c) => {
+    try {
+      const body = await c.req.json();
+      const parsed = credentialsSchema.parse(body);
+      const cleaned = parsed.anthropicApiKey?.trim() || null;
 
-  /**
-   * Pull-Initiated Push endpoint:
-   * - Flushes all blocks with `seq > after` as NDJSON lines.
-   * - If `idle` / `error`, writes `{"type":"done",...}` and closes HTTP response immediately.
-   * - If `running`, keeps pushing live broadcast blocks until turn finishes, then closes.
-   */
-  app.get('/api/sessions/:id/sync', async (c) => {
-    const sessionId = c.req.param('id');
-    const rawAfter = c.req.query('after');
-    const afterSeq = rawAfter !== undefined ? Math.max(0, parseInt(rawAfter, 10) || 0) : 0;
+      if (!engine.store.setSetting) {
+        return c.json(
+          { error: 'Active store adapter does not support runtime settings.' },
+          501,
+        );
+      }
 
-    // Validate session exists before opening stream headers so missing IDs return clean 404
-    await engine.getSessionStatus(sessionId);
-
-    c.header('Content-Type', 'application/x-ndjson; charset=utf-8');
-    c.header('Cache-Control', 'no-cache, no-transform');
-    c.header('Connection', 'keep-alive');
-    c.header('X-Accel-Buffering', 'no');
-
-    return stream(c, async (s) => {
-      const controller = new AbortController();
-      s.onAbort(() => {
-        controller.abort();
+      await engine.store.setSetting(ANTHROPIC_KEY_SETTING, cleaned);
+      const updated = await resolveConfiguredAnthropicKey(engine);
+      return c.json({
+        configured: updated.configured,
+        source: updated.source,
+        maskedKey: updated.maskedKey,
       });
+    } catch (err) {
+      if (err instanceof ZodError) {
+        return c.json({ error: 'Invalid credentials payload' }, 400);
+      }
+      throw err;
+    }
+  });
 
-      try {
-        for await (const frame of engine.streamSync(
-          sessionId,
-          afterSeq,
-          controller.signal,
-        )) {
-          if (controller.signal.aborted) break;
-          await s.writeln(JSON.stringify(frame));
-        }
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          console.error(`[sync] stream error on session ${sessionId}:`, err);
+  // Delegate all core OpenAgents protocol routes (`/api/sessions/*`, `/api/harnesses`, `/api/health`)
+  app.all('/api/*', (c) => coreHandler(c.req.raw));
+
+  // Optional single-port static SPA serving for turnkey Docker & CLI runs
+  const staticRoot = options.staticDir ? path.resolve(options.staticDir) : null;
+  const indexHtmlPath = staticRoot ? path.join(staticRoot, 'index.html') : null;
+
+  if (staticRoot && indexHtmlPath && existsSync(indexHtmlPath)) {
+    app.get('*', async (c) => {
+      const reqPath = decodeURIComponent(c.req.path);
+      const candidate = path.resolve(staticRoot, `.${reqPath}`);
+
+      // Prevent path traversal outside staticRoot
+      if (
+        candidate.startsWith(`${staticRoot}${path.sep}`) &&
+        existsSync(candidate)
+      ) {
+        const info = await stat(candidate);
+        if (info.isFile()) {
+          const ext = path.extname(candidate).toLowerCase();
+          const contentType = MIME_TYPES[ext] ?? 'application/octet-stream';
+          const bytes = await readFile(candidate);
+          return new Response(bytes, {
+            status: 200,
+            headers: {
+              'Content-Type': contentType,
+              ...(reqPath.startsWith('/assets/')
+                ? { 'Cache-Control': 'public, max-age=31536000, immutable' }
+                : {}),
+            },
+          });
         }
       }
-    });
-  });
 
-  app.onError((err, c) => {
-    if (err instanceof SessionNotFoundError) {
-      return c.json({ error: err.message, code: err.code }, 404);
-    }
-    if (err instanceof SessionBusyError) {
-      return c.json({ error: err.message, code: err.code }, 409);
-    }
-    if (err instanceof HarnessNotFoundError) {
-      return c.json({ error: err.message, code: err.code }, 400);
-    }
-    if (err instanceof ZodError) {
-      return c.json(
-        {
-          error: err.issues.map((i) => i.message).join('; '),
-          code: 'VALIDATION_ERROR',
+      const html = await readFile(indexHtmlPath);
+      return new Response(html, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-cache',
         },
-        400,
-      );
-    }
-
-    console.error('[server] unhandled error:', err);
-    return c.json(
-      {
-        error: err instanceof Error ? err.message : 'Internal server error',
-        code: 'INTERNAL_ERROR',
-      },
-      500,
-    );
-  });
+      });
+    });
+  }
 
   return app;
 }

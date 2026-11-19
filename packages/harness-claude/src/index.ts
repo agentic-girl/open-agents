@@ -15,6 +15,7 @@ export interface ClaudeHarnessOptions {
   defaultModel?: string;
   supportedModels?: readonly string[];
   apiKey?: string;
+  resolveApiKey?: () => Promise<string | undefined> | string | undefined;
   systemPrompt?: string;
   maxTurns?: number;
   permissionMode?: PermissionMode;
@@ -64,6 +65,7 @@ export class ClaudeHarnessAdapter implements HarnessAdapter {
     const effectiveSystemPrompt = ctx.systemPrompt ?? this.options.systemPrompt;
     const permissionMode: PermissionMode =
       this.options.permissionMode ?? 'bypassPermissions';
+    const dynamicApiKey = await this.options.resolveApiKey?.();
 
     const sdkOptions: ClaudeSdkOptions = {
       cwd: ctx.cwd,
@@ -74,7 +76,7 @@ export class ClaudeHarnessAdapter implements HarnessAdapter {
         : {}),
       includePartialMessages: false,
       abortController,
-      env: this.buildSubprocessEnv(),
+      env: this.buildSubprocessEnv(dynamicApiKey),
       ...(ctx.harnessSessionId ? { resume: ctx.harnessSessionId } : {}),
       ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
       ...(this.options.maxTurns !== undefined ? { maxTurns: this.options.maxTurns } : {}),
@@ -279,7 +281,7 @@ export class ClaudeHarnessAdapter implements HarnessAdapter {
     }
   }
 
-  private buildSubprocessEnv(): Record<string, string> {
+  private buildSubprocessEnv(dynamicApiKey?: string): Record<string, string> {
     const env: Record<string, string> = {};
     for (const [key, value] of Object.entries(process.env)) {
       if (value !== undefined && key !== 'CLAUDECODE') {
@@ -289,7 +291,8 @@ export class ClaudeHarnessAdapter implements HarnessAdapter {
     if (this.options.env) {
       Object.assign(env, this.options.env);
     }
-    const apiKey = this.options.apiKey ?? process.env.ANTHROPIC_API_KEY;
+    const apiKey =
+      dynamicApiKey ?? this.options.apiKey ?? process.env.ANTHROPIC_API_KEY;
     if (apiKey) {
       env.ANTHROPIC_API_KEY = apiKey;
     }

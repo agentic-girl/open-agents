@@ -87,12 +87,14 @@ flowchart TD
 ```text
 open-agents/
 ├── packages/
-│   ├── core/                  # @open-agents/core — pure TS ports, domain types, engine
+│   ├── core/                  # @open-agents/core — pure TS ports, engine, Web-Standard HTTP handler
 │   ├── store-sqlite/          # @open-agents/store-sqlite — SQLite WAL StoreAdapter
 │   └── harness-claude/        # @open-agents/harness-claude — Claude Agent SDK adapter
 ├── apps/
-│   ├── server/                # @open-agents/server — Stateless Hono HTTP API + runner wiring
+│   ├── server/                # @open-agents/server — Single-port Hono server (/api/* + static SPA)
 │   └── web/                   # @open-agents/web — Turnkey ChatGPT-style React + Tailwind SPA
+├── .github/workflows/ci.yml   # Automated tests + multi-arch GHCR container publishing
+├── Dockerfile                 # Unified single-image build (UI + API on port 3000)
 ├── docker-compose.yml         # One-command full-stack container deployment
 ├── pnpm-workspace.yaml
 ├── turbo.json

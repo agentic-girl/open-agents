@@ -82,3 +82,9 @@ export interface HarnessMetadata {
   defaultModel: string;
   supportedModels: string[];
 }
+
+export interface CredentialStatus {
+  configured: boolean;
+  source: 'env' | 'store' | 'oauth' | 'none';
+  maskedKey: string | null;
+}

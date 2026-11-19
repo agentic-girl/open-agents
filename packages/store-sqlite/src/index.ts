@@ -134,6 +134,12 @@ export class SqliteStoreAdapter implements StoreAdapter {
         PRIMARY KEY (session_id, seq),
         FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
       );
+
+      CREATE TABLE IF NOT EXISTS runtime_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
 
     // Recover any sessions orphaned in 'running' state by an unclean process crash
@@ -278,6 +284,32 @@ export class SqliteStoreAdapter implements StoreAdapter {
       createdAt: row.created_at,
       payload: JSON.parse(row.payload_json) as BlockPayload,
     }));
+  }
+
+  async getSetting(key: string): Promise<string | null> {
+    const row = this.db
+      .prepare<[string], { value: string }>(
+        `SELECT value FROM runtime_settings WHERE key = ?`,
+      )
+      .get(key);
+    return row?.value ?? null;
+  }
+
+  async setSetting(key: string, value: string | null): Promise<void> {
+    if (value === null) {
+      this.db.prepare(`DELETE FROM runtime_settings WHERE key = ?`).run(key);
+      return;
+    }
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`
+        INSERT INTO runtime_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT (key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = excluded.updated_at
+      `)
+      .run(key, value, now);
   }
 
   close(): void {

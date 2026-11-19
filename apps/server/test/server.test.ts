@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -20,7 +20,7 @@ async function readNdjsonResponse(res: Response): Promise<SyncFrame[]> {
     .map((line) => JSON.parse(line) as SyncFrame);
 }
 
-describe('Hono Stateless API & Pull-Initiated Push', () => {
+describe('Hono Stateless API, Single-Port SPA & Zero-Restart Credentials', () => {
   let tempDir: string;
   let engine: OpenAgentsEngine;
 
@@ -58,7 +58,6 @@ describe('Hono Stateless API & Pull-Initiated Push', () => {
 
     const app = createServerApp(engine);
 
-    // 1. Create session
     const createRes = await app.request('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -68,14 +67,12 @@ describe('Hono Stateless API & Pull-Initiated Push', () => {
     const created = (await createRes.json()) as { id: string; model: string };
     expect(created.model).toBe('claude-sonnet-5-5');
 
-    // 2. Idle sync closes immediately with latestSeq=0
     const idleSyncRes = await app.request(`/api/sessions/${created.id}/sync?after=0`);
     expect(idleSyncRes.status).toBe(200);
     expect(await readNdjsonResponse(idleSyncRes)).toEqual([
       { type: 'done', status: 'idle', latestSeq: 0 },
     ]);
 
-    // 3. Submit turn (202 Accepted)
     const turnRes = await app.request(`/api/sessions/${created.id}/turns`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -83,7 +80,6 @@ describe('Hono Stateless API & Pull-Initiated Push', () => {
     });
     expect(turnRes.status).toBe(202);
 
-    // Wait until thinking block (seq=2) lands in SQLite
     while (true) {
       const statusRes = await app.request(`/api/sessions/${created.id}/status`);
       const snap = (await statusRes.json()) as { status: string; latestSeq: number };
@@ -94,7 +90,6 @@ describe('Hono Stateless API & Pull-Initiated Push', () => {
       await new Promise((r) => setTimeout(r, 10));
     }
 
-    // 4. Two independent dumb frontends open /sync simultaneously at different offsets
     const tab1Promise = app
       .request(`/api/sessions/${created.id}/sync?after=0`)
       .then(readNdjsonResponse);
@@ -102,7 +97,6 @@ describe('Hono Stateless API & Pull-Initiated Push', () => {
       .request(`/api/sessions/${created.id}/sync?after=1`)
       .then(readNdjsonResponse);
 
-    // Give both streams a tick to flush catch-up and attach to broadcast
     await new Promise((r) => setTimeout(r, 25));
     finishTurn();
 
@@ -113,7 +107,6 @@ describe('Hono Stateless API & Pull-Initiated Push', () => {
         .filter((f): f is Extract<SyncFrame, { type: 'block' }> => f.type === 'block')
         .map((f) => f.block.seq);
 
-    // seq 1: user_message, seq 2: thinking, seq 3: assistant_message, seq 4: turn_result
     expect(seqs(tab1Frames)).toEqual([1, 2, 3, 4]);
     expect(seqs(tab2Frames)).toEqual([2, 3, 4]);
     expect(tab1Frames.at(-1)).toEqual({
@@ -121,5 +114,54 @@ describe('Hono Stateless API & Pull-Initiated Push', () => {
       status: 'idle',
       latestSeq: 4,
     });
+  });
+
+  it('persists zero-restart runtime credentials with masked secret output and serves single-port SPA', async () => {
+    const webDist = path.join(tempDir, 'web-dist');
+    await mkdir(path.join(webDist, 'assets'), { recursive: true });
+    await writeFile(path.join(webDist, 'index.html'), '<html>OpenAgents</html>');
+    await writeFile(path.join(webDist, 'assets', 'app.js'), 'console.log("ok")');
+
+    const harness: HarnessAdapter = {
+      id: 'claude',
+      displayName: 'Claude Agent SDK',
+      defaultModel: 'claude-sonnet-5-5',
+      async runTurn() {},
+    };
+
+    engine = new OpenAgentsEngine({
+      store: new SqliteStoreAdapter({ dbPath: path.join(tempDir, 'settings.db') }),
+      harnesses: [harness],
+      workspaceRoot: path.join(tempDir, 'workspaces'),
+    });
+
+    const app = createServerApp(engine, { staticDir: webDist });
+
+    // Save runtime API key via UI endpoint
+    const saveRes = await app.request('/api/settings/credentials', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ anthropicApiKey: 'sk-ant-api03-secretvalue9876' }),
+    });
+    expect(saveRes.status).toBe(200);
+    const saved = (await saveRes.json()) as {
+      configured: boolean;
+      source: string;
+      maskedKey: string;
+    };
+    expect(saved).toEqual({
+      configured: true,
+      source: 'store',
+      maskedKey: 'sk-ant-...9876',
+    });
+
+    // Serves static assets and SPA fallback on the same port
+    const assetRes = await app.request('/assets/app.js');
+    expect(assetRes.status).toBe(200);
+    expect(await assetRes.text()).toBe('console.log("ok")');
+
+    const spaRes = await app.request('/?s=sess_123');
+    expect(spaRes.status).toBe(200);
+    expect(await spaRes.text()).toBe('<html>OpenAgents</html>');
   });
 });

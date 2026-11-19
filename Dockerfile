@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS base
+FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -17,25 +17,26 @@ COPY packages/core/package.json packages/core/tsconfig.json ./packages/core/
 COPY packages/store-sqlite/package.json packages/store-sqlite/tsconfig.json ./packages/store-sqlite/
 COPY packages/harness-claude/package.json packages/harness-claude/tsconfig.json ./packages/harness-claude/
 COPY apps/server/package.json apps/server/tsconfig.json ./apps/server/
+COPY apps/web/package.json apps/web/tsconfig.json ./apps/web/
 
 RUN pnpm install --frozen-lockfile
 
 COPY packages ./packages
-COPY apps/server ./apps/server
+COPY apps ./apps
 
-RUN pnpm --filter @open-agents/server... build
-
-RUN mkdir -p /data /workspaces /home/node/.claude \
+RUN pnpm build \
+  && mkdir -p /data /workspaces /home/node/.claude \
   && chown -R node:node /app /data /workspaces /home/node
 
 USER node
 
 ENV NODE_ENV=production
-ENV PORT=3001
+ENV PORT=3000
 ENV HOST=0.0.0.0
 ENV DATABASE_PATH=/data/open-agents.db
 ENV WORKSPACE_ROOT=/workspaces
+ENV WEB_DIST_DIR=/app/apps/web/dist
 
-EXPOSE 3001
+EXPOSE 3000
 
 CMD ["node", "apps/server/dist/index.js"]

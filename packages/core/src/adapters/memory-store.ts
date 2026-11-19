@@ -6,6 +6,7 @@ import type { BlockPayload, Session, SessionBlock, SessionStatusSnapshot } from 
 export class MemoryStoreAdapter implements StoreAdapter {
   private readonly sessions = new Map<string, Session>();
   private readonly blocks = new Map<string, SessionBlock[]>();
+  private readonly settings = new Map<string, string>();
 
   async createSession(input: CreateSessionInput): Promise<Session> {
     const now = new Date().toISOString();
@@ -107,5 +108,17 @@ export class MemoryStoreAdapter implements StoreAdapter {
     const list = this.blocks.get(sessionId);
     if (!list) return [];
     return list.filter((b) => b.seq > afterSeq).slice(0, limit);
+  }
+
+  async getSetting(key: string): Promise<string | null> {
+    return this.settings.get(key) ?? null;
+  }
+
+  async setSetting(key: string, value: string | null): Promise<void> {
+    if (value === null) {
+      this.settings.delete(key);
+    } else {
+      this.settings.set(key, value);
+    }
   }
 }

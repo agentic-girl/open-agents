@@ -1,16 +1,40 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowUp,
+  ExternalLink,
   FolderOpen,
+  KeyRound,
   PanelLeftOpen,
   Radio,
   Square,
   SquarePen,
 } from 'lucide-react';
 import { BlockList } from './components/BlockList';
+import { CredentialsModal } from './components/CredentialsModal';
 import { Sidebar } from './components/Sidebar';
 import { useSessionBroadcast } from './hooks/useSessionBroadcast';
-import type { HarnessMetadata, Session } from './types';
+import type { CredentialStatus, HarnessMetadata, Session } from './types';
+
+const STARTER_PROMPTS = [
+  {
+    title: 'Write & test an LRU cache',
+    subtitle: 'Creates a module + unit tests and runs them in the workspace',
+    prompt:
+      'Write a generic LRU cache in JavaScript (lru.mjs) and a test suite using node:test (lru.test.mjs), run the tests, and summarize the results.',
+  },
+  {
+    title: 'Benchmark sorting in Python',
+    subtitle: 'Runs a real script and formats a Markdown comparison table',
+    prompt:
+      'Write and run a short Python script that benchmarks sorting 50,000 integers vs strings over 10 runs, and reply with a Markdown table of mean latency.',
+  },
+  {
+    title: 'Scaffold a miniature CLI',
+    subtitle: 'Builds a working CLI tool and verifies its --help output',
+    prompt:
+      'Create a zero-dependency Node.js CLI file todo.mjs supporting add/list/done against a JSON file, run a quick smoke test via Bash, and show the output.',
+  },
+] as const;
 
 function readUrlSessionId(): string | null {
   const params = new URLSearchParams(window.location.search);
@@ -39,6 +63,11 @@ export function App() {
   const [promptInput, setPromptInput] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  const [credentialStatus, setCredentialStatus] =
+    useState<CredentialStatus | null>(null);
+  const [credentialsModalOpen, setCredentialsModalOpen] = useState(false);
+  const [dismissedKeyBanner, setDismissedKeyBanner] = useState(false);
+
   const scrollEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -53,6 +82,17 @@ export function App() {
     }
   }, []);
 
+  const refreshCredentials = useCallback(async () => {
+    try {
+      const res = await fetch('/api/settings/credentials');
+      if (!res.ok) return;
+      const status = (await res.json()) as CredentialStatus;
+      setCredentialStatus(status);
+    } catch {
+      // Ignore if mounted against a custom core-only handler without settings routes
+    }
+  }, []);
+
   const {
     blocks,
     status,
@@ -63,7 +103,6 @@ export function App() {
     abortTurn,
   } = useSessionBroadcast(activeSessionId, refreshSessions);
 
-  // Load harnesses & initial sessions, plus lightweight sidebar refresh for multi-tab visibility
   useEffect(() => {
     fetch('/api/harnesses')
       .then((res) => (res.ok ? res.json() : null))
@@ -77,7 +116,9 @@ export function App() {
       })
       .catch(() => {});
 
+    void refreshCredentials();
     void refreshSessions();
+
     const id = window.setInterval(() => {
       void refreshSessions();
     }, 3000);
@@ -91,14 +132,12 @@ export function App() {
       window.clearInterval(id);
       window.removeEventListener('popstate', onPopState);
     };
-  }, [refreshSessions]);
+  }, [refreshSessions, refreshCredentials]);
 
-  // Auto-scroll when new blocks arrive
   useEffect(() => {
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [blocks.length, status]);
 
-  // Auto-resize textarea
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -111,6 +150,18 @@ export function App() {
     writeUrlSessionId(sessionId);
   };
 
+  const handleSaveCredentials = async (anthropicApiKey: string | null) => {
+    const res = await fetch('/api/settings/credentials', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ anthropicApiKey }),
+    });
+    if (res.ok) {
+      const updated = (await res.json()) as CredentialStatus;
+      setCredentialStatus(updated);
+    }
+  };
+
   const handleDeleteSession = async (sessionId: string) => {
     await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: 'DELETE',
@@ -121,9 +172,8 @@ export function App() {
     await refreshSessions();
   };
 
-  const handleSend = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-    const trimmed = promptInput.trim();
+  const dispatchMessage = async (rawText: string) => {
+    const trimmed = rawText.trim();
     if (!trimmed || submitting || status === 'running') return;
 
     setSubmitting(true);
@@ -169,10 +219,15 @@ export function App() {
     }
   };
 
+  const handleSend = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    void dispatchMessage(promptInput);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      void handleSend();
+      void dispatchMessage(promptInput);
     }
   };
 
@@ -181,6 +236,10 @@ export function App() {
     harnesses.find((h) => h.id === selectedHarnessId) ?? harnesses[0];
   const modelChoices = activeHarness?.supportedModels ?? ['claude-sonnet-5-5'];
   const isBusy = submitting || status === 'running';
+  const showSetupNotice =
+    credentialStatus !== null &&
+    !credentialStatus.configured &&
+    !dismissedKeyBanner;
 
   return (
     <div className="flex h-full w-full overflow-hidden bg-[#212121]">
@@ -255,41 +314,135 @@ export function App() {
             )}
           </div>
 
-          {activeSessionId && (
-            <div className="flex items-center gap-2 text-xs font-mono text-zinc-400">
-              <span
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border ${
-                  receiverMode === 'syncing'
-                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                    : receiverMode === 'reconnecting'
-                      ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-                      : 'border-zinc-700/80 bg-zinc-800/60 text-zinc-400'
-                }`}
-                title="Pull-Initiated Push broadcast status and local sequence watermark"
-              >
-                <Radio
-                  className={`w-3 h-3 ${
-                    receiverMode === 'syncing' ? 'animate-pulse' : ''
+          <div className="flex items-center gap-2">
+            {activeSessionId && (
+              <>
+                <span
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-mono ${
+                    receiverMode === 'syncing'
+                      ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                      : receiverMode === 'reconnecting'
+                        ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                        : 'border-zinc-700/80 bg-zinc-800/60 text-zinc-400'
+                  }`}
+                  title="Pull-Initiated Push broadcast status and local sequence watermark"
+                >
+                  <Radio
+                    className={`w-3 h-3 ${
+                      receiverMode === 'syncing' ? 'animate-pulse' : ''
+                    }`}
+                  />
+                  <span>seq #{latestSeq}</span>
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    window.open(
+                      window.location.href,
+                      '_blank',
+                      'noopener,noreferrer',
+                    )
+                  }
+                  title="Open a 2nd dumb receiver tab tuned to this session's live broadcast"
+                  className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-zinc-700/80 bg-zinc-800/60 hover:bg-zinc-700/70 text-xs text-zinc-300 transition-colors"
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  <span>2nd receiver</span>
+                </button>
+              </>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setCredentialsModalOpen(true)}
+              title={
+                credentialStatus?.configured
+                  ? `API key configured (${credentialStatus.source})`
+                  : 'Configure API key'
+              }
+              className="p-2 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors relative"
+            >
+              <KeyRound className="w-4 h-4" />
+              {credentialStatus && (
+                <span
+                  className={`w-1.5 h-1.5 rounded-full absolute top-2 right-1.5 ${
+                    credentialStatus.configured
+                      ? 'bg-emerald-400'
+                      : 'bg-amber-400'
                   }`}
                 />
-                <span>seq #{latestSeq}</span>
-              </span>
-            </div>
-          )}
+              )}
+            </button>
+          </div>
         </header>
 
         {/* Main Chat / Empty Landing */}
         <main className="flex-1 overflow-y-auto">
           {!activeSessionId || (blocks.length === 0 && !isBusy) ? (
-            <div className="h-full flex flex-col items-center justify-center px-4 text-center">
-              <h1 className="text-2xl sm:text-3xl font-semibold text-zinc-100 tracking-tight mb-2">
-                What would you like to build?
-              </h1>
-              <p className="text-sm text-zinc-400 max-w-md">
-                Powered by{' '}
-                <span className="text-zinc-300 font-mono">{selectedModel}</span>{' '}
-                in an isolated workspace with durable broadcast streaming.
-              </p>
+            <div className="h-full flex flex-col items-center justify-center px-4 py-10">
+              <div className="max-w-2xl w-full text-center space-y-6">
+                <div className="space-y-2">
+                  <h1 className="text-2xl sm:text-3xl font-semibold text-zinc-100 tracking-tight">
+                    What would you like to build?
+                  </h1>
+                  <p className="text-sm text-zinc-400">
+                    Powered by{' '}
+                    <span className="text-zinc-300 font-mono">
+                      {selectedModel}
+                    </span>{' '}
+                    in an isolated workspace with durable broadcast streaming.
+                  </p>
+                </div>
+
+                {showSetupNotice && (
+                  <div className="rounded-2xl border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-left flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="text-xs text-zinc-200 leading-relaxed">
+                      <span className="font-semibold text-amber-300">
+                        No ANTHROPIC_API_KEY detected.
+                      </span>{' '}
+                      Set a key right here with zero restarts, or dismiss if you
+                      are already signed in locally via{' '}
+                      <code className="text-zinc-100">claude auth login</code>.
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setDismissedKeyBanner(true)}
+                        className="px-2.5 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-zinc-200"
+                      >
+                        Dismiss
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setCredentialsModalOpen(true)}
+                        className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-400 hover:bg-amber-300 text-zinc-950 transition-colors"
+                      >
+                        Set API Key
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-left pt-2">
+                  {STARTER_PROMPTS.map((item) => (
+                    <button
+                      key={item.title}
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void dispatchMessage(item.prompt)}
+                      className="rounded-2xl border border-zinc-800 bg-[#1a1a1a] hover:bg-zinc-800/70 hover:border-zinc-700 p-3.5 transition-colors flex flex-col justify-between gap-1.5"
+                    >
+                      <span className="text-xs font-medium text-zinc-200">
+                        {item.title}
+                      </span>
+                      <span className="text-[11px] text-zinc-400 leading-snug">
+                        {item.subtitle}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           ) : (
             <div>
@@ -309,7 +462,7 @@ export function App() {
         {/* Composer */}
         <footer className="shrink-0 px-4 pb-5 pt-2">
           <form
-            onSubmit={(e) => void handleSend(e)}
+            onSubmit={handleSend}
             className="max-w-3xl mx-auto rounded-3xl bg-[#2f2f2f] border border-zinc-700/60 focus-within:border-zinc-500 px-4 py-3 flex items-end gap-3 shadow-lg"
           >
             <textarea
@@ -344,6 +497,13 @@ export function App() {
           </form>
         </footer>
       </div>
+
+      <CredentialsModal
+        open={credentialsModalOpen}
+        onClose={() => setCredentialsModalOpen(false)}
+        status={credentialStatus}
+        onSaveKey={handleSaveCredentials}
+      />
     </div>
   );
 }

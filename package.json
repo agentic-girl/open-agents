@@ -6,6 +6,7 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
+    "start": "pnpm build && pnpm --filter @open-agents/server start",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck"
   },
