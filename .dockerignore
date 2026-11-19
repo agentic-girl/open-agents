@@ -1,0 +1,14 @@
+**/node_modules
+**/dist
+**/.turbo
+.git
+.env
+.env.*
+!.env.example
+data
+workspaces
+*.db
+*.db-wal
+*.db-shm
+*.log
+.DS_Store

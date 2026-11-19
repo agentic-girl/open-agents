@@ -1,0 +1,35 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    ports:
+      - "3001:3001"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - PORT=3001
+      - HOST=0.0.0.0
+      - DATABASE_PATH=/data/open-agents.db
+      - WORKSPACE_ROOT=/workspaces
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-5-5}
+    volumes:
+      - open-agents-data:/data
+      - open-agents-workspaces:/workspaces
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  open-agents-data:
+  open-agents-workspaces:

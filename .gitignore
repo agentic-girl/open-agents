@@ -9,9 +9,12 @@ build
 *.db-journal
 *.db-wal
 *.db-shm
+.open-agents
+workspaces
+data
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 *.log
 *.swp
 *.swo

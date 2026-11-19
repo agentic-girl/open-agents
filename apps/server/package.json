@@ -1,0 +1,30 @@
+{
+  "name": "@open-agents/server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stateless Hono HTTP API and Pull-Initiated Push server for OpenAgents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.8",
+    "@open-agents/core": "workspace:*",
+    "@open-agents/harness-claude": "workspace:*",
+    "@open-agents/store-sqlite": "workspace:*",
+    "dotenv": "^16.4.7",
+    "hono": "^4.7.2",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}
